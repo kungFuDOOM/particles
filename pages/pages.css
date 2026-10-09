@@ -1,0 +1,4 @@
+@import "../src/styles.css";
+
+/* The Pages build is rooted in pages/, so point Tailwind at the app sources. */
+@source "../src";

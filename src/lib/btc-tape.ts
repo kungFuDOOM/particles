@@ -1,3 +1,6 @@
+import { takerSide, type TapePayload } from "@/lib/coinbase-tape";
+import { fetchTape } from "@/lib/tape-feed";
+
 export type Side = "buy" | "sell";
 
 export type Print = {
@@ -27,10 +30,6 @@ type Listener = {
   getWindow?: () => number;
 };
 
-/** Taker side. Coinbase `side` is the maker: a maker sell means someone lifted the offer. */
-export function takerSide(makerSide: string): Side {
-  return makerSide === "sell" ? "buy" : "sell";
-}
 
 export function startTape(listener: Listener) {
   const seen = new Set<number>();
@@ -115,7 +114,7 @@ export function startTape(listener: Listener) {
     push({ id, side: takerSide(row.side), price: px, notional: px * size }, announceWhale);
   };
 
-  const applyPayload = (payload: { price?: number; open?: number; trades?: { id: number; side: Side; price: number; size: number }[] }, announceWhale: boolean) => {
+  const applyPayload = (payload: Partial<TapePayload>, announceWhale: boolean) => {
     if (typeof payload.open === "number") open = payload.open;
     if (typeof payload.price === "number") price = payload.price;
     const trades = payload.trades ?? [];
@@ -131,14 +130,8 @@ export function startTape(listener: Listener) {
 
   const poll = async (announceWhale: boolean) => {
     try {
-      const res = await fetch("/api/tape");
-      if (!res.ok) return;
-      const body = (await res.json()) as {
-        price?: number;
-        open?: number;
-        trades?: { id: number; side: Side; price: number; size: number }[];
-      };
-      if (stopped) return;
+      const body = await fetchTape();
+      if (!body || stopped) return;
       // Primed history is not a live feed; only the polling fallback counts as one.
       if (announceWhale) status = "live";
       applyPayload(body, announceWhale);
