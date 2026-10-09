@@ -13,4 +13,16 @@ npm run dev
 
 Open `http://127.0.0.1:8080`.
 
-Prints come from the Coinbase exchange tape. The dev server proxies that feed, so the browser does not call Coinbase directly.
+Prints stream from Coinbase's public WebSocket feed. On load, and whenever the socket cannot connect, the app reads `/api/tape`, a server-side proxy of Coinbase's REST trades and 24h stats.
+
+## Rendering
+
+The field is a stack of layers the browser composites on the GPU:
+
+- a CSS backdrop with soft side glows that follow the buy/sell balance,
+- a persistent trail canvas (screen-blended on dark grounds, multiplied on Paper) with a frame-rate-independent fade,
+- a quarter-size bloom canvas,
+- an overlay canvas for the front seam, shockwaves, flashes and drifting dust, cleared every frame,
+- a CSS vignette.
+
+**Save image** flattens the same stack into one PNG and stamps a caption with price, flow split and time.

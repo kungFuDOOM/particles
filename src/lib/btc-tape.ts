@@ -83,8 +83,6 @@ export function startTape(listener: Listener) {
     lastSide = print.side;
     flow.push({ t: Date.now(), side: print.side, usd: print.notional });
     show(print, announceWhale);
-    status = "live";
-    gotLive = true;
   };
 
   const flushPile = () => {
@@ -131,7 +129,7 @@ export function startTape(listener: Listener) {
     emitState();
   };
 
-  const poll = async () => {
+  const poll = async (announceWhale: boolean) => {
     try {
       const res = await fetch("/api/tape");
       if (!res.ok) return;
@@ -140,7 +138,10 @@ export function startTape(listener: Listener) {
         open?: number;
         trades?: { id: number; side: Side; price: number; size: number }[];
       };
-      applyPayload(body, true);
+      if (stopped) return;
+      // Primed history is not a live feed; only the polling fallback counts as one.
+      if (announceWhale) status = "live";
+      applyPayload(body, announceWhale);
     } catch {
       /* next tick */
     }
@@ -148,8 +149,8 @@ export function startTape(listener: Listener) {
 
   const startPoll = () => {
     if (pollTimer || stopped) return;
-    void poll();
-    pollTimer = window.setInterval(() => void poll(), 1000);
+    void poll(true);
+    pollTimer = window.setInterval(() => void poll(true), 1000);
   };
 
   const connect = () => {
@@ -196,6 +197,8 @@ export function startTape(listener: Listener) {
       }
       if (msg.type === "match" || msg.type === "last_match") {
         window.clearTimeout(watchdog);
+        gotLive = true;
+        status = "live";
         takeRow(msg, msg.type === "match");
       }
     };
@@ -210,16 +213,9 @@ export function startTape(listener: Listener) {
     };
   };
 
-  void fetch("https://api.exchange.coinbase.com/products/BTC-USD/stats")
-    .then((res) => (res.ok ? res.json() : null))
-    .then((stats: { open?: string; last?: string } | null) => {
-      if (!stats) return;
-      if (stats.open) open = Number(stats.open);
-      if (price == null && stats.last) price = Number(stats.last);
-      emitState();
-    })
-    .catch(() => undefined);
-
+  // Prime price, 24h open and the last few dozen prints through the server proxy,
+  // so the field has something to draw before the socket delivers its first match.
+  void poll(false);
   connect();
   stateTimer = window.setInterval(emitState, 250);
   pileTimer = window.setInterval(flushPile, 180);
