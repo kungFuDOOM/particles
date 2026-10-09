@@ -46,6 +46,48 @@ type Ripple = { x: number; y: number; r: number; a: number; side: 0 | 1 };
 
 type Job = { side: 0 | 1; notional: number };
 
+type Lane = { color: string; width: number; core?: { color: string; width: number } };
+
+/** Stroke styles per lane, indexed side * 3 + tier (0 fading, 1 body, 2 hot). */
+const LIGHT_LANES: Lane[] = [
+  { color: "rgba(8,120,86,0.5)", width: 1.3 },
+  { color: "rgba(12,170,116,0.7)", width: 1.7 },
+  { color: "rgba(30,220,156,0.88)", width: 2.5, core: { color: "rgba(200,255,236,0.42)", width: 1 } },
+  { color: "rgba(130,22,18,0.55)", width: 1.3 },
+  { color: "rgba(200,36,28,0.74)", width: 1.7 },
+  { color: "rgba(246,66,40,0.9)", width: 2.5, core: { color: "rgba(255,214,190,0.42)", width: 1 } },
+];
+
+const INK_LANES: Lane[] = [
+  { color: "rgba(40,140,104,0.35)", width: 1.2 },
+  { color: "rgba(6,118,74,0.78)", width: 1.8 },
+  { color: "rgba(3,84,52,0.95)", width: 2.6 },
+  { color: "rgba(196,70,52,0.38)", width: 1.2 },
+  { color: "rgba(168,28,18,0.8)", width: 1.8 },
+  { color: "rgba(116,14,8,0.95)", width: 2.6 },
+];
+
+/**
+ * The field is drawn as stacked layers the browser composites on the GPU:
+ * a CSS backdrop, the persistent trail canvas (blended with screen, or multiply on paper),
+ * a quarter-size glow canvas, and an overlay canvas redrawn from scratch every frame.
+ */
+export type FieldLayers = {
+  backdrop: HTMLElement;
+  trail: HTMLCanvasElement;
+  glow: HTMLCanvasElement;
+  overlay: HTMLCanvasElement;
+};
+
+type View = {
+  backdrop: HTMLElement;
+  trail: CanvasRenderingContext2D;
+  glow: CanvasRenderingContext2D;
+  overlay: CanvasRenderingContext2D;
+};
+
+type Motes = { count: number; x: Float32Array; y: Float32Array; phase: Float32Array; size: Float32Array };
+
 export function sanitizeSettings(raw: Partial<FieldSettings> | null | undefined): FieldSettings {
   return {
     intensity: clamp(num(raw?.intensity, DEFAULT_SETTINGS.intensity), 0.5, 2.2),
@@ -85,10 +127,14 @@ export class AetherField {
   particles: Particle[] = [];
   ripples: Ripple[] = [];
   private ground: GroundId = "ink";
-  private buyBody: number[] = [];
-  private buyHot: number[] = [];
-  private sellBody: number[] = [];
-  private sellHot: number[] = [];
+  private lanes: number[][] = [[], [], [], [], [], []];
+  private view: View | null = null;
+  private backKey = "";
+  private glowAlpha = -1;
+  private frame = 0;
+  private motes: Motes = { count: 0, x: new Float32Array(0), y: new Float32Array(0), phase: new Float32Array(0), size: new Float32Array(0) };
+  private frameDt = 1 / 60;
+  private crowd = 0;
   private queue: Job[] = [];
   private mobile = false;
   private bias = 0;
@@ -119,7 +165,29 @@ export class AetherField {
     this.dpr = dpr;
     this.mobile = w < 760;
     if (this.band <= 0) this.band = this.h * 0.58;
+    this.seedMotes(sx, sy);
     this.needsClear = true;
+  }
+
+  /** Slow dust that drifts behind the streams, like the sparkle in the share card. */
+  private seedMotes(sx: number, sy: number) {
+    const count = Math.round(clamp((this.w * this.h) / 5200, 60, 320));
+    const prev = this.motes;
+    const next: Motes = {
+      count,
+      x: new Float32Array(count),
+      y: new Float32Array(count),
+      phase: new Float32Array(count),
+      size: new Float32Array(count),
+    };
+    for (let i = 0; i < count; i++) {
+      const keep = i < prev.count;
+      next.x[i] = keep ? prev.x[i] * sx : Math.random() * this.w;
+      next.y[i] = keep ? prev.y[i] * sy : Math.random() * this.h;
+      next.phase[i] = keep ? prev.phase[i] : Math.random();
+      next.size[i] = keep ? prev.size[i] : 0.8 + Math.random() * Math.random() * 1.8;
+    }
+    this.motes = next;
   }
 
   setBand(y: number) {
@@ -166,11 +234,12 @@ export class AetherField {
 
   step(dt: number, settings: FieldSettings) {
     this.t += dt;
+    this.frameDt = dt;
     const clash = settings.clash * (this.reduce ? 0.5 : 1);
     this.bias += (this.biasTarget - this.bias) * Math.min(1, dt * 1.5);
     this.pressure += (this.pressureTarget - this.pressure) * Math.min(1, dt * 2.4);
     const drive = clamp(this.bias * 0.55 + this.pressure * 0.45, -1, 1);
-    const target = 0.5 + drive * 0.4 * Math.min(clash, 1.8);
+    const target = clamp(0.5 + drive * 0.4 * Math.min(clash, 1.8), 0.14, 0.86);
     this.front += (target - this.front) * Math.min(1, dt * 1.6);
     this.flash.a = Math.max(0, this.flash.a - dt * 1.35);
     this.surgeBuy *= Math.exp(-dt * 1.35);
@@ -209,6 +278,7 @@ export class AetherField {
     const cap = Math.round((this.mobile ? 1600 : 2800) * (0.7 + settings.intensity * 0.35));
     let alive = 0;
     for (const p of this.particles) if (p.alive) alive++;
+    this.crowd += (clamp(alive / cap, 0, 1) - this.crowd) * Math.min(1, dt * 2);
     if (alive > cap) {
       let extra = alive - cap;
       for (const p of this.particles) {
@@ -240,7 +310,7 @@ export class AetherField {
       let dvx = dir * (220 + clash * 60) * (1 - shear * 0.78);
       dvx += (broad.x * 0.74 + fine.x * 0.26) * turb;
       dvx += -Math.cos(wave) * Math.sign(dist || dir) * shear * 240;
-      let dvy = roll * dir + (broad.y * 0.74 + fine.y * 0.26) * turb;
+      const dvy = roll * dir + (broad.y * 0.74 + fine.y * 0.26) * turb;
       const invaded = dir === 1 ? dist > 36 : dist < -36;
       p.life -= dt * (invaded ? 0.2 : 0.038);
       const steer = Math.min(1, dt * (3.2 + age * 7));
@@ -261,6 +331,19 @@ export class AetherField {
       if (p.life <= 0 || p.x < -80 || p.x > this.w + 80 || p.y < -80 || p.y > this.h + 80) p.alive = false;
     }
 
+    const m = this.motes;
+    const moteDrift = this.reduce ? 4 : 14;
+    for (let i = 0; i < m.count; i++) {
+      const flow = curl2(m.x[i] * 0.0022 + 40, m.y[i] * 0.0022 + this.t * 0.05);
+      const dir = m.x[i] < fx ? 1 : -1;
+      m.x[i] += (flow.x * moteDrift + dir * 3) * dt;
+      m.y[i] += flow.y * moteDrift * dt;
+      if (m.x[i] < -4) m.x[i] += this.w + 8;
+      else if (m.x[i] > this.w + 4) m.x[i] -= this.w + 8;
+      if (m.y[i] < -4) m.y[i] += this.h + 8;
+      else if (m.y[i] > this.h + 4) m.y[i] -= this.h + 8;
+    }
+
     for (let i = this.ripples.length - 1; i >= 0; i--) {
       const r = this.ripples[i];
       r.r += dt * (640 + r.r * 0.55);
@@ -269,45 +352,137 @@ export class AetherField {
     }
   }
 
-  draw(ctx: CanvasRenderingContext2D, settings: FieldSettings) {
+  attach(layers: FieldLayers) {
+    const trail = layers.trail.getContext("2d", { alpha: false });
+    const glow = layers.glow.getContext("2d");
+    const overlay = layers.overlay.getContext("2d");
+    if (!trail || !glow || !overlay) return false;
+    this.view = { backdrop: layers.backdrop, trail, glow, overlay };
+    this.needsClear = true;
+    this.backKey = "";
+    this.glowAlpha = -1;
+    return true;
+  }
+
+  /** Sizes every layer to the field; the glow layer runs at a quarter of CSS resolution. */
+  fitLayers() {
+    const view = this.view;
+    if (!view) return;
+    const dw = Math.round(this.w * this.dpr);
+    const dh = Math.round(this.h * this.dpr);
+    for (const ctx of [view.trail, view.overlay]) {
+      if (ctx.canvas.width !== dw || ctx.canvas.height !== dh) {
+        ctx.canvas.width = dw;
+        ctx.canvas.height = dh;
+        this.needsClear = true;
+      }
+    }
+    const gw = Math.max(1, Math.round(this.w / 4));
+    const gh = Math.max(1, Math.round(this.h / 4));
+    if (view.glow.canvas.width !== gw || view.glow.canvas.height !== gh) {
+      view.glow.canvas.width = gw;
+      view.glow.canvas.height = gh;
+    }
+    this.backKey = "";
+  }
+
+  draw(settings: FieldSettings) {
+    const view = this.view;
+    if (!view) return;
     const ground = GROUNDS[settings.ground];
-    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    ctx.globalCompositeOperation = "source-over";
-    if (this.needsClear || this.ground !== settings.ground) {
-      ctx.fillStyle = ground.hex;
-      ctx.fillRect(0, 0, this.w, this.h);
-      this.needsClear = false;
-      this.ground = settings.ground;
+    const ink = !ground.additive;
+    const { trail, glow, overlay } = view;
+    const fresh = this.needsClear || this.ground !== settings.ground;
+    this.needsClear = false;
+    this.ground = settings.ground;
+    this.frame++;
+
+    // Trails: black for light-emitting grounds, white for ink on paper.
+    trail.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    trail.globalCompositeOperation = "source-over";
+    if (fresh) {
+      trail.fillStyle = ink ? "#fff" : "#000";
+      trail.fillRect(0, 0, this.w, this.h);
     } else {
-      const fade = ground.additive ? 0.042 - settings.trail * 0.024 : 0.11 - settings.trail * 0.05;
-      const [r, g, b] = ground.rgb;
-      ctx.fillStyle = `rgba(${r},${g},${b},${fade.toFixed(3)})`;
-      ctx.fillRect(0, 0, this.w, this.h);
+      const perFrame = ink ? 0.11 - settings.trail * 0.065 : 0.05 - settings.trail * 0.034;
+      const fade = 1 - Math.pow(1 - perFrame, this.frameDt * 60);
+      trail.fillStyle = ink ? `rgba(255,255,255,${fade.toFixed(4)})` : `rgba(0,0,0,${fade.toFixed(4)})`;
+      trail.fillRect(0, 0, this.w, this.h);
+      // An 8-bit alpha fade stalls a few levels short of the ground and leaves ghosts.
+      // Every few frames, burn (or dodge) by a hair so faint residue reaches pure black (or white).
+      if (this.frame % 3 === 0) {
+        trail.globalCompositeOperation = ink ? "color-dodge" : "color-burn";
+        trail.fillStyle = ink ? "rgb(6,6,6)" : "rgb(249,249,249)";
+        trail.fillRect(0, 0, this.w, this.h);
+        trail.globalCompositeOperation = "source-over";
+      }
+    }
+    this.strokeParticles(trail, ink);
+
+    // Bloom flatters a sparse field but washes a crowded one out to white.
+    const glowAlpha = ink ? 0 : Math.round((0.5 - this.crowd * 0.32) * 50) / 50;
+    if (glowAlpha !== this.glowAlpha) {
+      this.glowAlpha = glowAlpha;
+      glow.canvas.style.opacity = String(glowAlpha);
+    }
+    if (!ink) {
+      glow.setTransform(1, 0, 0, 1, 0, 0);
+      glow.globalCompositeOperation = "copy";
+      glow.filter = "blur(2px)";
+      glow.drawImage(trail.canvas, 0, 0, glow.canvas.width, glow.canvas.height);
+      glow.filter = "none";
     }
 
-    const wash = ctx.createLinearGradient(0, 0, this.w, 0);
-    const front = clamp(this.front, 0.08, 0.92);
-    wash.addColorStop(0, ground.additive ? "rgba(61,222,180,0.2)" : "rgba(18,110,86,0.1)");
-    wash.addColorStop(front, "rgba(0,0,0,0)");
-    wash.addColorStop(1, ground.additive ? "rgba(226,91,58,0.2)" : "rgba(150,48,28,0.1)");
-    ctx.fillStyle = wash;
+    overlay.setTransform(1, 0, 0, 1, 0, 0);
+    overlay.clearRect(0, 0, overlay.canvas.width, overlay.canvas.height);
+    overlay.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    this.drawOverlay(overlay, ink);
+
+    this.syncBackdrop(view.backdrop, ground.hex, ink);
+  }
+
+  /** Flattens the layers into one canvas, as the screen shows them, for saving. */
+  snapshot(settings: FieldSettings) {
+    const view = this.view;
+    if (!view || typeof document === "undefined") return null;
+    const ground = GROUNDS[settings.ground];
+    const ink = !ground.additive;
+    const out = document.createElement("canvas");
+    out.width = view.trail.canvas.width;
+    out.height = view.trail.canvas.height;
+    const ctx = out.getContext("2d");
+    if (!ctx) return null;
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    ctx.fillStyle = ground.hex;
     ctx.fillRect(0, 0, this.w, this.h);
-
-    if (this.flash.a > 0.02) {
-      const radius = 80 + (1 - this.flash.a) * 420;
-      const glow = ctx.createRadialGradient(this.flash.x, this.flash.y, 8, this.flash.x, this.flash.y, radius);
-      const rgb = this.flash.side === 0 ? "0,214,140" : "232,42,32";
-      glow.addColorStop(0, `rgba(${rgb},${(this.flash.a * 0.55).toFixed(3)})`);
-      glow.addColorStop(1, `rgba(${rgb},0)`);
-      ctx.fillStyle = glow;
-      ctx.fillRect(0, 0, this.w, this.h);
+    this.drawAtmosphere(ctx, ink);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = ink ? "multiply" : "screen";
+    ctx.drawImage(view.trail.canvas, 0, 0);
+    if (!ink && this.glowAlpha > 0) {
+      ctx.globalAlpha = this.glowAlpha;
+      ctx.drawImage(view.glow.canvas, 0, 0, out.width, out.height);
+      ctx.globalAlpha = 1;
     }
+    ctx.globalCompositeOperation = ink ? "source-over" : "screen";
+    ctx.drawImage(view.overlay.canvas, 0, 0);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    this.drawVignette(ctx, ink);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    return out;
+  }
 
-    this.buyBody.length = 0;
-    this.buyHot.length = 0;
-    this.sellBody.length = 0;
-    this.sellHot.length = 0;
+  private drawOverlay(ctx: CanvasRenderingContext2D, ink: boolean) {
+    this.drawMotes(ctx, ink);
+    this.drawFlash(ctx, ink);
+    this.drawRipples(ctx, ink);
+    this.drawSeam(ctx, ink);
+    ctx.globalCompositeOperation = "source-over";
+  }
 
+  private strokeParticles(ctx: CanvasRenderingContext2D, ink: boolean) {
+    for (const lane of this.lanes) lane.length = 0;
     const maxSeg = 260 * 260;
     for (const p of this.particles) {
       if (!p.alive) continue;
@@ -315,61 +490,197 @@ export class AetherField {
       const dy = p.y - p.py;
       const seg = dx * dx + dy * dy;
       if (seg < 0.04 || seg > maxSeg) continue;
-      const dest = p.side === 0 ? (p.spark ? this.buyHot : this.buyBody) : p.spark ? this.sellHot : this.sellBody;
-      dest.push(p.x - dx * 6.4, p.y - dy * 6.4, p.x, p.y);
+      const fast = seg > 15 * 15;
+      const tier = p.spark || (fast && p.life > 0.5) ? 2 : p.life > 0.42 ? 1 : 0;
+      this.lanes[p.side * 3 + tier].push(p.x - dx * 6.4, p.y - dy * 6.4, p.x, p.y);
     }
-
+    const tones = ink ? INK_LANES : LIGHT_LANES;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.globalCompositeOperation = "source-over";
-    if (ground.additive) {
-      this.strokeLane(ctx, this.buyBody, "rgba(0,196,118,0.84)", 2.7);
-      this.strokeLane(ctx, this.sellBody, "rgba(214,30,26,0.86)", 2.7);
-      this.strokeLane(ctx, this.buyHot, "rgba(0,230,156,0.96)", 4.8);
-      this.strokeLane(ctx, this.sellHot, "rgba(255,64,36,0.96)", 4.8);
-      ctx.globalCompositeOperation = "lighter";
-      this.strokeLane(ctx, this.buyBody, "rgba(110,255,205,0.5)", 1.05);
-      this.strokeLane(ctx, this.sellBody, "rgba(255,130,100,0.5)", 1.05);
-      this.strokeLane(ctx, this.buyHot, "rgba(220,255,242,0.75)", 1.7);
-      this.strokeLane(ctx, this.sellHot, "rgba(255,200,170,0.75)", 1.7);
-    } else {
-      this.strokeLane(ctx, this.buyBody, "rgba(6,118,74,0.9)", 2.6);
-      this.strokeLane(ctx, this.buyHot, "rgba(4,92,58,1)", 4.4);
-      this.strokeLane(ctx, this.sellBody, "rgba(168,28,18,0.92)", 2.6);
-      this.strokeLane(ctx, this.sellHot, "rgba(120,16,10,1)", 4.4);
+    for (let i = 0; i < 6; i++) this.strokeLane(ctx, this.lanes[i], tones[i].color, tones[i].width);
+    if (ink) return;
+    ctx.globalCompositeOperation = "lighter";
+    for (let i = 0; i < 6; i++) {
+      const core = tones[i].core;
+      if (core) this.strokeLane(ctx, this.lanes[i], core.color, core.width);
     }
-
-    const fx = this.front * this.w;
-    const lead = this.bias >= 0;
     ctx.globalCompositeOperation = "source-over";
-    ctx.beginPath();
-    ctx.moveTo(fx, this.h * 0.14);
-    ctx.lineTo(fx, Math.max(this.h * 0.2, this.band - 28));
-    ctx.strokeStyle = lead ? "rgba(61,222,180,0.75)" : "rgba(226,91,58,0.75)";
-    ctx.lineWidth = 3.25;
-    ctx.stroke();
+  }
 
-    const labelY = Math.max(this.h * 0.2, this.band - 16);
-    ctx.font = "600 12px Instrument Sans, sans-serif";
-    ctx.textBaseline = "bottom";
-    ctx.textAlign = "left";
-    ctx.fillStyle = "rgba(61,222,180,0.9)";
-    ctx.fillText("BUYS", 14, labelY);
-    ctx.textAlign = "right";
-    ctx.fillStyle = "rgba(226,91,58,0.9)";
-    ctx.fillText("SELLS", this.w - 14, labelY);
+  private atmosphere(ink: boolean) {
+    const share = clamp(0.5 + this.pressure * 0.5, 0, 1);
+    const base = ink ? 0.07 : 0.13;
+    return {
+      fx: this.front * this.w,
+      cy: this.h * 0.55,
+      reach: Math.max(this.w, this.h) * 0.75,
+      buy: ink ? "18,140,100" : "31,191,138",
+      sell: ink ? "170,46,24" : "226,70,44",
+      buyA: (base * (0.55 + share * 0.9)).toFixed(3),
+      sellA: (base * (0.55 + (1 - share) * 0.9)).toFixed(3),
+      key: `${Math.round(share * 40)}|${Math.round(this.front * 80)}`,
+    };
+  }
 
+  /** Soft side glows as a CSS background, rewritten only when the balance visibly moves. */
+  private syncBackdrop(el: HTMLElement, hex: string, ink: boolean) {
+    const a = this.atmosphere(ink);
+    const key = `${this.w}x${this.h}|${hex}|${a.key}`;
+    if (key === this.backKey) return;
+    this.backKey = key;
+    const r = Math.round(a.reach);
+    const cy = Math.round(a.cy);
+    const layers = [
+      `radial-gradient(circle ${r}px at 0px ${cy}px, rgba(${a.buy},${a.buyA}), rgba(${a.buy},0))`,
+      `radial-gradient(circle ${r}px at ${Math.round(this.w)}px ${cy}px, rgba(${a.sell},${a.sellA}), rgba(${a.sell},0))`,
+    ];
+    if (!ink) {
+      const fx = Math.round(a.fx);
+      layers.unshift(
+        `linear-gradient(90deg, transparent ${fx - 160}px, rgba(255,240,225,0.035) ${fx}px, transparent ${fx + 160}px)`,
+      );
+    }
+    el.style.background = `${layers.join(", ")}, ${hex}`;
+  }
+
+  private drawAtmosphere(ctx: CanvasRenderingContext2D, ink: boolean) {
+    const a = this.atmosphere(ink);
+    const buy = ctx.createRadialGradient(0, a.cy, 0, 0, a.cy, a.reach);
+    buy.addColorStop(0, `rgba(${a.buy},${a.buyA})`);
+    buy.addColorStop(1, `rgba(${a.buy},0)`);
+    ctx.fillStyle = buy;
+    ctx.fillRect(0, 0, this.w, this.h);
+    const sell = ctx.createRadialGradient(this.w, a.cy, 0, this.w, a.cy, a.reach);
+    sell.addColorStop(0, `rgba(${a.sell},${a.sellA})`);
+    sell.addColorStop(1, `rgba(${a.sell},0)`);
+    ctx.fillStyle = sell;
+    ctx.fillRect(0, 0, this.w, this.h);
+    if (ink) return;
+    const seam = ctx.createLinearGradient(a.fx - 160, 0, a.fx + 160, 0);
+    seam.addColorStop(0, "rgba(255,240,225,0)");
+    seam.addColorStop(0.5, "rgba(255,240,225,0.035)");
+    seam.addColorStop(1, "rgba(255,240,225,0)");
+    ctx.fillStyle = seam;
+    ctx.fillRect(a.fx - 160, 0, 320, this.h);
+  }
+
+  private drawMotes(ctx: CanvasRenderingContext2D, ink: boolean) {
+    const fx = this.front * this.w;
+    const m = this.motes;
+    ctx.globalCompositeOperation = ink ? "source-over" : "lighter";
+    for (let side = 0; side < 2; side++) {
+      for (let pass = 0; pass < 2; pass++) {
+        ctx.beginPath();
+        for (let i = 0; i < m.count; i++) {
+          const x = m.x[i];
+          if ((x < fx ? 0 : 1) !== side) continue;
+          const tw = 0.5 + 0.5 * Math.sin(this.t * (0.8 + m.phase[i] * 1.6) + m.phase[i] * 40);
+          if ((tw > 0.62 ? 1 : 0) !== pass) continue;
+          const s = m.size[i] * (pass ? 1.25 : 1);
+          ctx.rect(x - s / 2, m.y[i] - s / 2, s, s);
+        }
+        ctx.fillStyle = ink
+          ? side === 0
+            ? pass
+              ? "rgba(6,110,72,0.5)"
+              : "rgba(6,110,72,0.22)"
+            : pass
+              ? "rgba(150,34,20,0.5)"
+              : "rgba(150,34,20,0.22)"
+          : side === 0
+            ? pass
+              ? "rgba(170,255,225,0.75)"
+              : "rgba(90,220,175,0.28)"
+            : pass
+              ? "rgba(255,200,175,0.75)"
+              : "rgba(240,96,70,0.28)";
+        ctx.fill();
+      }
+    }
+    ctx.globalCompositeOperation = "source-over";
+  }
+
+  private drawFlash(ctx: CanvasRenderingContext2D, ink: boolean) {
+    if (this.flash.a <= 0.02) return;
+    const { x, y, a, side } = this.flash;
+    const radius = 90 + (1 - a) * 380;
+    const glow = ctx.createRadialGradient(x, y, 0, x, y, radius);
+    const rgb = ink ? (side === 0 ? "10,130,90" : "190,50,30") : side === 0 ? "40,230,160" : "255,70,40";
+    const peak = a * (ink ? 0.16 : 0.42);
+    glow.addColorStop(0, `rgba(${rgb},${peak.toFixed(3)})`);
+    glow.addColorStop(0.35, `rgba(${rgb},${(peak * 0.35).toFixed(3)})`);
+    glow.addColorStop(1, `rgba(${rgb},0)`);
+    ctx.globalCompositeOperation = ink ? "source-over" : "lighter";
+    ctx.fillStyle = glow;
+    ctx.fillRect(x - radius, y - radius, radius * 2, radius * 2);
+    ctx.globalCompositeOperation = "source-over";
+  }
+
+  private drawRipples(ctx: CanvasRenderingContext2D, ink: boolean) {
+    if (!this.ripples.length) return;
+    ctx.globalCompositeOperation = ink ? "source-over" : "lighter";
     for (const ripple of this.ripples) {
+      const a = clamp(ripple.a, 0, 1);
+      const rgb = ink ? (ripple.side === 0 ? "8,110,72" : "160,36,20") : ripple.side === 0 ? "61,222,180" : "240,96,64";
       ctx.beginPath();
       ctx.arc(ripple.x, ripple.y, ripple.r, 0, Math.PI * 2);
-      ctx.strokeStyle =
-        ripple.side === 0
-          ? `rgba(61,222,180,${ripple.a})`
-          : `rgba(226,91,58,${ripple.a})`;
-      ctx.lineWidth = 2.4 + ripple.a * 3;
+      if (!ink) {
+        ctx.strokeStyle = `rgba(${rgb},${(a * 0.12).toFixed(3)})`;
+        ctx.lineWidth = 10 + (1 - a) * 18;
+        ctx.stroke();
+      }
+      ctx.strokeStyle = `rgba(${rgb},${(a * (ink ? 0.45 : 0.6)).toFixed(3)})`;
+      ctx.lineWidth = 1 + a * 1.6;
       ctx.stroke();
     }
     ctx.globalCompositeOperation = "source-over";
+  }
+
+  private drawSeam(ctx: CanvasRenderingContext2D, ink: boolean) {
+    const fx = this.front * this.w;
+    const top = this.h * 0.14;
+    const bottom = Math.max(this.h * 0.24, this.band - 28);
+    const lead = this.bias >= 0;
+    const rgb = ink ? (lead ? "6,110,72" : "150,34,20") : lead ? "61,222,180" : "240,96,64";
+    const fadeLine = (alpha: number) => {
+      const g = ctx.createLinearGradient(0, top, 0, bottom);
+      g.addColorStop(0, `rgba(${rgb},0)`);
+      g.addColorStop(0.18, `rgba(${rgb},${alpha})`);
+      g.addColorStop(0.82, `rgba(${rgb},${alpha})`);
+      g.addColorStop(1, `rgba(${rgb},0)`);
+      return g;
+    };
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(fx, top);
+    ctx.lineTo(fx, bottom);
+    if (!ink) {
+      ctx.globalCompositeOperation = "lighter";
+      ctx.strokeStyle = fadeLine(0.08);
+      ctx.lineWidth = 18;
+      ctx.stroke();
+      ctx.strokeStyle = fadeLine(0.2);
+      ctx.lineWidth = 6;
+      ctx.stroke();
+    }
+    ctx.globalCompositeOperation = "source-over";
+    ctx.strokeStyle = fadeLine(ink ? 0.7 : 0.9);
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  /** Matches the CSS vignette over the live view. */
+  private drawVignette(ctx: CanvasRenderingContext2D, ink: boolean) {
+    const cx = this.w / 2;
+    const cy = this.h / 2;
+    const r = Math.hypot(cx, cy);
+    const v = ctx.createRadialGradient(cx, cy, r * (ink ? 0.55 : 0.4), cx, cy, r);
+    v.addColorStop(0, "rgba(0,0,0,0)");
+    v.addColorStop(1, ink ? "rgba(60,46,28,0.14)" : "rgba(0,0,0,0.55)");
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = v;
+    ctx.fillRect(0, 0, this.w, this.h);
   }
 
   private detonate(side: 0 | 1, power: number) {
