@@ -29,12 +29,14 @@ PAGES_BASE=/particles/ npm run pages:build   # writes dist-pages/
 
 ## Rendering
 
-The field is a stack of layers the browser composites on the GPU:
+With WebGL2 (`src/lib/trail-gl.ts`) the whole field is one opaque canvas, so the browser composites a single layer with no CSS blend modes:
 
-- a CSS backdrop with soft side glows that follow the buy/sell balance,
-- a persistent trail canvas (screen-blended on dark grounds, multiplied on Paper) with a frame-rate-independent fade,
-- a quarter-size bloom canvas,
-- an overlay canvas for the front seam, shockwaves, flashes and drifting dust, cleared every frame,
-- a CSS vignette.
+- particle streaks are instanced, anti-aliased quads, one draw call per colour lane, accumulating in a half-float trail buffer with a frame-rate-independent fade,
+- the final pass blooms the trail on the GPU and screens it over the backdrop glows (multiplies it into Paper), with the vignette; the backdrop is cached in a quarter-size texture and redrawn only when the buy/sell balance moves,
+- dust, flashes, shockwave rings (as thin ring meshes) and the front seam are drawn on top.
 
-**Save image** flattens the same stack into one PNG and stamps a caption with price, flow split and time.
+Auto-quality lowers the render resolution while frames run long, then thins the particles if that is not enough, and restores both once frames recover. The Controls panel shows the renderer, frame rate and current scaling.
+
+Without usable GPU acceleration the field falls back to Canvas2D layers (trail, glow, overlay) over a CSS backdrop and vignette.
+
+**Save image** flattens what is on screen into one PNG and stamps a caption with price, flow split and time.

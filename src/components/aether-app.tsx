@@ -5,6 +5,7 @@ import {
   DEFAULT_SETTINGS,
   GROUNDS,
   type FieldSettings,
+  type FieldStats,
   type GroundId,
   loadSettings,
   saveSettings,
@@ -33,6 +34,7 @@ export function AetherApp() {
   const [settings, setSettings] = useState<FieldSettings>(DEFAULT_SETTINGS);
   const [ready, setReady] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [stats, setStats] = useState<FieldStats | null>(null);
   const [open, setOpen] = useState(false);
   const [tape, setTape] = useState<TapeState>(EMPTY_TAPE);
   const [whale, setWhale] = useState<{ side: Side; notional: number; at: number } | null>(null);
@@ -141,6 +143,15 @@ export function AetherApp() {
     return () => window.removeEventListener("keydown", onKey);
   }, [open]);
 
+  // While the panel is open, show which renderer is running and what auto-quality is doing.
+  useEffect(() => {
+    if (!open) return;
+    const read = () => setStats(fieldRef.current?.stats() ?? null);
+    read();
+    const timer = window.setInterval(read, 1000);
+    return () => window.clearInterval(timer);
+  }, [open]);
+
   useEffect(() => {
     return () => {
       window.clearTimeout(savedTimer.current);
@@ -163,7 +174,7 @@ export function AetherApp() {
       className="relative h-dvh w-full overflow-hidden bg-bg text-fg select-none"
     >
       <div aria-hidden="true" className={`field ${GROUNDS[settings.ground].additive ? "field-light" : "field-ink"}`}>
-        <div ref={backdropRef} className={`ground-${settings.ground}`} />
+        <div ref={backdropRef} className={`field-backdrop ground-${settings.ground}`} />
         <canvas ref={trailRef} className="field-trail" />
         <canvas ref={glowRef} className="field-glow" />
         <canvas ref={overlayRef} className="field-overlay" />
@@ -205,7 +216,7 @@ export function AetherApp() {
           <button
             type="button"
             data-controls
-            className="glass pointer-events-auto inline-flex min-h-11 shrink-0 items-center gap-2 rounded-full border border-border bg-surface/80 px-4 text-sm font-medium text-fg backdrop-blur-md transition-colors hover:bg-surface"
+            className="glass pointer-events-auto inline-flex min-h-11 shrink-0 items-center gap-2 rounded-full border border-border bg-surface/90 px-4 text-sm font-medium text-fg transition-colors hover:bg-surface"
             aria-expanded={open}
             aria-controls="field-controls"
             onClick={() => setOpen((value) => !value)}
@@ -219,7 +230,7 @@ export function AetherApp() {
           {whale ? (
             <p
               key={whale.at}
-              className="toast glass inline-flex items-center gap-2 rounded-full border border-border bg-surface/80 px-3 py-1.5 text-sm backdrop-blur-md"
+              className="toast glass inline-flex items-center gap-2 rounded-full border border-border bg-surface/90 px-3 py-1.5 text-sm"
             >
               <span className={`size-2 rounded-full ${whale.side === "buy" ? "bg-accent" : "bg-sell"}`} aria-hidden="true" />
               <span className="font-medium">Whale {whale.side}</span>
@@ -271,7 +282,7 @@ export function AetherApp() {
           <section
             id="field-controls"
             data-controls
-            className="glass dock-panel pointer-events-auto mb-3 w-full max-w-xl rounded-2xl border border-border bg-surface/90 p-4 shadow-2xl backdrop-blur-xl sm:mb-5 sm:p-5"
+            className="glass dock-panel pointer-events-auto mb-3 w-full max-w-xl rounded-2xl border border-border bg-surface/95 p-4 shadow-2xl sm:mb-5 sm:p-5"
             aria-label="Field controls"
           >
             <div className="grid gap-1">
@@ -340,6 +351,7 @@ export function AetherApp() {
                 {saved ? "Saved" : "Save image"}
               </button>
             </div>
+            {stats ? <p className="mt-3 text-center text-xs text-muted tabular-nums">{statsLine(stats)}</p> : null}
           </section>
         </div>
       ) : null}
@@ -462,6 +474,14 @@ function Chip({
       {children}
     </button>
   );
+}
+
+function statsLine(stats: FieldStats) {
+  const parts = [stats.renderer === "gpu" ? "GPU renderer" : "Basic renderer", `${stats.fps} fps`];
+  if (stats.resolution < 100) parts.push(`${stats.resolution}% resolution`);
+  if (stats.detail < 100) parts.push(`${stats.detail}% particles`);
+  if (stats.resolution >= 100 && stats.detail >= 100) parts.push("full quality");
+  return parts.join(" · ");
 }
 
 function leadLabel(buy: number, sell: number) {

@@ -1,5 +1,5 @@
 import type { Print, Side } from "@/lib/btc-tape";
-import { GLTrail, type Rgba } from "@/lib/trail-gl";
+import { GLTrail, SHAPE_GLOW, SHAPE_STRIDE, type Composite, type Rgba } from "@/lib/trail-gl";
 
 export type GroundId = "ink" | "abyss" | "coal" | "paper";
 
@@ -81,15 +81,31 @@ export type FieldLayers = {
   overlay: HTMLCanvasElement;
 };
 
-/** Trails go through WebGL2 when available; Canvas2D (with a separate glow canvas) otherwise. */
+/**
+ * WebGL2 draws the whole field into the trail canvas. Without it, Canvas2D draws the trail,
+ * glow and overlay canvases and CSS supplies the backdrop and vignette.
+ */
 type View = {
+  root: HTMLElement | null;
   backdrop: HTMLElement;
   trailCanvas: HTMLCanvasElement;
   gl: GLTrail | null;
   trail: CanvasRenderingContext2D | null;
   glow: CanvasRenderingContext2D | null;
-  overlay: CanvasRenderingContext2D;
+  overlay: CanvasRenderingContext2D | null;
 };
+
+export type FieldStats = {
+  renderer: "gpu" | "basic";
+  fps: number;
+  /** Share of full resolution the field renders at, 0..100. */
+  resolution: number;
+  /** Share of the full particle budget in use, 0..100. */
+  detail: number;
+};
+
+/** Shape instances the overlay can hold: dust, two strokes per shockwave and the flash. */
+const SHAPE_CAPACITY = 512;
 
 type Motes = { count: number; x: Float32Array; y: Float32Array; phase: Float32Array; size: Float32Array };
 
@@ -147,7 +163,13 @@ export class AetherField {
   private liveCount = 0;
   private free = Int32Array.from({ length: CAPACITY }, (_, i) => CAPACITY - 1 - i);
   private freeCount = CAPACITY;
-  private segs = new Float32Array(CAPACITY * 4);
+  // One slot past the particles holds the front seam, drawn with the same streak shader.
+  private segs = new Float32Array((CAPACITY + 1) * 4);
+  private shapes = new Float32Array(SHAPE_CAPACITY * SHAPE_STRIDE);
+  /** Share of the particle budget in use; trimmed once resolution can drop no further. */
+  private detail = 1;
+  private fpsEma = 60;
+  private lastInk = false;
   private laneCursor = new Int32Array(6);
   private laneStart = new Int32Array(6);
   private laneCount = new Int32Array(6);
@@ -304,17 +326,17 @@ export class AetherField {
     while (budget > 0 && this.queue.length) {
       const job = this.queue.shift();
       if (!job) break;
-      budget -= this.spawnJob(job, settings.intensity, budget);
+      budget -= this.spawnJob(job, settings.intensity * this.detail, budget);
     }
 
     if (!this.reduce) {
       const tilt = Math.abs(this.pressure);
-      const pour = Math.round((this.mobile ? 4 : 7) * (0.45 + tilt * 2.1));
+      const pour = Math.round((this.mobile ? 4 : 7) * (0.45 + tilt * 2.1) * this.detail);
       const buyShare = clamp(0.5 + this.pressure * 0.5, 0.05, 0.95);
       for (let i = 0; i < pour; i++) this.birth(Math.random() < buyShare ? 0 : 1, false);
     }
 
-    const cap = Math.round((this.mobile ? 1600 : 2800) * (0.7 + settings.intensity * 0.35));
+    const cap = Math.round((this.mobile ? 1600 : 2800) * (0.7 + settings.intensity * 0.35) * this.detail);
     this.crowd += (clamp(this.liveCount / cap, 0, 1) - this.crowd) * Math.min(1, dt * 2);
     if (this.liveCount > cap) {
       let extra = this.liveCount - cap;
@@ -410,15 +432,15 @@ export class AetherField {
   }
 
   attach(layers: FieldLayers) {
-    const overlay = layers.overlay.getContext("2d");
-    if (!overlay) return false;
     const gl = GLTrail.create(layers.trail);
     const trail = gl ? null : layers.trail.getContext("2d", { alpha: false });
     const glow = gl ? null : layers.glow.getContext("2d");
-    if (!gl && (!trail || !glow)) return false;
-    // The GL path blooms inside its own present pass, so the separate glow canvas sits idle.
-    layers.glow.style.display = gl ? "none" : "";
-    this.view = { backdrop: layers.backdrop, trailCanvas: layers.trail, gl, trail, glow, overlay };
+    const overlay = gl ? null : layers.overlay.getContext("2d");
+    if (!gl && (!trail || !glow || !overlay)) return false;
+    // With WebGL the trail canvas is the whole picture; CSS hides the other layers (styles.css).
+    const root = layers.trail.parentElement;
+    root?.setAttribute("data-renderer", gl ? "gpu" : "basic");
+    this.view = { root, backdrop: layers.backdrop, trailCanvas: layers.trail, gl, trail, glow, overlay };
     this.needsClear = true;
     this.backKey = "";
     this.glowAlpha = -1;
@@ -440,7 +462,7 @@ export class AetherField {
       view.trailCanvas.height = dh;
       this.needsClear = true;
     }
-    if (view.overlay.canvas.width !== dw || view.overlay.canvas.height !== dh) {
+    if (view.overlay && (view.overlay.canvas.width !== dw || view.overlay.canvas.height !== dh)) {
       view.overlay.canvas.width = dw;
       view.overlay.canvas.height = dh;
     }
@@ -478,7 +500,13 @@ export class AetherField {
       const base = ink ? WHITE : BLACK;
       if (gl.takeBlank() || fresh) gl.clear(base);
       else gl.fade(base, fade);
-      gl.upload(this.segs, this.laneStart[5] + this.laneCount[5]);
+      // The front seam rides in the slot after the last lane, so one upload covers both.
+      const seam = (this.laneStart[5] + this.laneCount[5]) * 4;
+      this.segs[seam] = this.front * this.w;
+      this.segs[seam + 1] = this.h * 0.14;
+      this.segs[seam + 2] = this.front * this.w;
+      this.segs[seam + 3] = Math.max(this.h * 0.24, this.band - 28);
+      gl.upload(this.segs, seam / 4 + 1);
       for (let i = 0; i < 6; i++) gl.strokes(this.laneStart[i], this.laneCount[i], tones[i].rgba, tones[i].width, false);
       if (!ink) {
         for (let i = 0; i < 6; i++) {
@@ -486,9 +514,12 @@ export class AetherField {
           if (core) gl.strokes(this.laneStart[i], this.laneCount[i], core.rgba, core.width, true);
         }
       }
-      gl.present(glowAlpha);
       this.glowAlpha = glowAlpha;
-    } else if (view.trail && view.glow) {
+      this.lastInk = ink;
+      this.composeGL(gl, ink);
+      return;
+    }
+    if (view.trail && view.glow && view.overlay) {
       const trail = view.trail;
       // Trails: black for light-emitting grounds, white for ink on paper.
       trail.setTransform(rs, 0, 0, rs, 0, 0);
@@ -521,15 +552,133 @@ export class AetherField {
         glow.drawImage(trail.canvas, 0, 0, glow.canvas.width, glow.canvas.height);
         glow.filter = "none";
       }
+
+      const overlay = view.overlay;
+      overlay.setTransform(1, 0, 0, 1, 0, 0);
+      overlay.clearRect(0, 0, overlay.canvas.width, overlay.canvas.height);
+      overlay.setTransform(rs, 0, 0, rs, 0, 0);
+      this.drawOverlay(overlay, ink);
+      this.syncBackdrop(view.backdrop, ground.hex, ink);
+    }
+  }
+
+  /** Renderer, frame rate and how far auto-quality has scaled things back. */
+  stats(): FieldStats {
+    return {
+      renderer: this.view?.gl ? "gpu" : "basic",
+      fps: Math.round(this.fpsEma),
+      resolution: Math.round(this.quality * 100),
+      detail: Math.round(this.detail * 100),
+    };
+  }
+
+  /**
+   * Paints the finished WebGL frame from the current trail: backdrop, trail, bloom and
+   * vignette in one pass, then dust, flash, shockwaves and the front seam on top.
+   */
+  private composeGL(gl: GLTrail, ink: boolean) {
+    const ground = GROUNDS[this.ground];
+    const a = this.atmosphere(ink);
+    const composite: Composite = {
+      glow: this.glowAlpha,
+      ink,
+      ground: [ground.rgb[0] / 255, ground.rgb[1] / 255, ground.rgb[2] / 255, 1],
+      buy: [a.buyRgb[0] / 255, a.buyRgb[1] / 255, a.buyRgb[2] / 255, Number(a.buyA)],
+      sell: [a.sellRgb[0] / 255, a.sellRgb[1] / 255, a.sellRgb[2] / 255, Number(a.sellA)],
+      cy: a.cy,
+      reach: a.reach,
+      fx: a.fx,
+      seam: ink ? 0 : 0.035,
+      // Same falloff as .field-vignette in styles.css.
+      vignetteFrom: ink ? 0.55 : 0.4,
+      vignette: ink ? [60 / 255, 46 / 255, 28 / 255, 0.14] : [0, 0, 0, 0.55],
+    };
+    gl.present(composite, `${this.ground}|${a.key}`);
+    const quads = this.packShapes(ink);
+    gl.shapes(this.shapes, quads, this.packRings(ink, quads), !ink);
+
+    // draw() uploaded the seam with the streaks, in the slot just past the last lane.
+    const seam = (this.laneStart[5] + this.laneCount[5]) * 4;
+    const lead = this.bias >= 0;
+    const rgb = ink ? (lead ? [6, 110, 72] : [150, 34, 20]) : lead ? [61, 222, 180] : [240, 96, 64];
+    const tone = (alpha: number): Rgba => [rgb[0] / 255, rgb[1] / 255, rgb[2] / 255, alpha];
+    if (!ink) {
+      gl.strokes(seam / 4, 1, tone(0.08), 18, true, true);
+      gl.strokes(seam / 4, 1, tone(0.2), 6, true, true);
+    }
+    gl.strokes(seam / 4, 1, tone(ink ? 0.7 : 0.9), 1.5, false, true);
+  }
+
+  /** Writes dust and the flash as disc and glow instances; returns how many. */
+  private packShapes(ink: boolean) {
+    let n = 0;
+    const push = (x: number, y: number, r: number, w: number, rgb: readonly number[], alpha: number) => {
+      n += this.writeShape(n, x, y, r, w, rgb, alpha);
+    };
+
+    const fx = this.front * this.w;
+    const m = this.motes;
+    for (let i = 0; i < m.count; i++) {
+      const side = m.x[i] < fx ? 0 : 1;
+      const tw = 0.5 + 0.5 * Math.sin(this.t * (0.8 + m.phase[i] * 1.6) + m.phase[i] * 40);
+      const bright = tw > 0.62;
+      // Same tones as drawMotes; a disc of radius 0.56·s covers about the area of an s-square.
+      const rgb = ink
+        ? side === 0
+          ? [6, 110, 72]
+          : [150, 34, 20]
+        : side === 0
+          ? bright
+            ? [170, 255, 225]
+            : [90, 220, 175]
+          : bright
+            ? [255, 200, 175]
+            : [240, 96, 70];
+      const alpha = ink ? (bright ? 0.5 : 0.22) : bright ? 0.75 : 0.28;
+      push(m.x[i], m.y[i], m.size[i] * (bright ? 1.25 : 1) * 0.56, 0, rgb, alpha);
     }
 
-    const overlay = view.overlay;
-    overlay.setTransform(1, 0, 0, 1, 0, 0);
-    overlay.clearRect(0, 0, overlay.canvas.width, overlay.canvas.height);
-    overlay.setTransform(rs, 0, 0, rs, 0, 0);
-    this.drawOverlay(overlay, ink);
+    if (this.flash.a > 0.02) {
+      const { x, y, a, side } = this.flash;
+      const rgb = ink ? (side === 0 ? [10, 130, 90] : [190, 50, 30]) : side === 0 ? [40, 230, 160] : [255, 70, 40];
+      push(x, y, 90 + (1 - a) * 380, SHAPE_GLOW, rgb, a * (ink ? 0.16 : 0.42));
+    }
 
-    this.syncBackdrop(view.backdrop, ground.hex, ink);
+    return n;
+  }
+
+  /** Appends the shockwave rings after the `from` shapes already written; returns how many. */
+  private packRings(ink: boolean, from: number) {
+    let n = 0;
+    for (const ripple of this.ripples) {
+      const a = clamp(ripple.a, 0, 1);
+      const rgb = ink
+        ? ripple.side === 0
+          ? [8, 110, 72]
+          : [160, 36, 20]
+        : ripple.side === 0
+          ? [61, 222, 180]
+          : [240, 96, 64];
+      if (!ink) n += this.writeShape(from + n, ripple.x, ripple.y, ripple.r, 10 + (1 - a) * 18, rgb, a * 0.12);
+      n += this.writeShape(from + n, ripple.x, ripple.y, ripple.r, 1 + a * 1.6, rgb, a * (ink ? 0.45 : 0.6));
+    }
+    return n;
+  }
+
+  /** Writes one shape instance at `index`; returns 1, or 0 when the buffer is full. */
+  private writeShape(index: number, x: number, y: number, r: number, w: number, rgb: readonly number[], alpha: number) {
+    if (index >= SHAPE_CAPACITY) return 0;
+    const out = this.shapes;
+    const o = index * SHAPE_STRIDE;
+    out[o] = x;
+    out[o + 1] = y;
+    out[o + 2] = r;
+    out[o + 3] = w;
+    out[o + 4] = (rgb[0] / 255) * alpha;
+    out[o + 5] = (rgb[1] / 255) * alpha;
+    out[o + 6] = (rgb[2] / 255) * alpha;
+    out[o + 7] = alpha;
+    return 1;
   }
 
   /**
@@ -541,6 +690,7 @@ export class AetherField {
     const now = typeof performance === "undefined" ? 0 : performance.now();
     const dt = this.lastNow ? Math.min(0.25, (now - this.lastNow) / 1000) : 1 / 60;
     this.lastNow = now;
+    if (dt > 0) this.fpsEma += (1 / dt - this.fpsEma) * 0.05;
     if (this.settle > 0) {
       this.settle -= dt;
       return;
@@ -556,16 +706,26 @@ export class AetherField {
       this.slowFor = 0;
       this.fastFor = 0;
     }
-    const floor = this.dpr >= 1.5 ? 0.6 : 0.75;
-    let next = this.quality;
-    if (this.slowFor > 1.2 && this.quality > floor) next = Math.max(floor, this.quality * 0.85);
-    else if (this.fastFor > 6 && this.quality < 1) next = Math.min(1, this.quality * 1.12);
-    if (next !== this.quality) {
-      this.quality = next;
+    // Resolution goes first; once it is as low as looks acceptable, thin out the particles.
+    // Recovery runs the other way round: particles back first, then sharpness.
+    const gpu = !!this.view?.gl;
+    const floor = this.dpr >= 1.5 ? (gpu ? 0.6 : 0.5) : gpu ? 0.75 : 0.6;
+    let quality = this.quality;
+    let detail = this.detail;
+    if (this.slowFor > 1.2) {
+      if (quality > floor) quality = Math.max(floor, quality * 0.85);
+      else if (detail > 0.45) detail = Math.max(0.45, detail * 0.85);
+    } else if (this.fastFor > 6) {
+      if (detail < 1) detail = Math.min(1, detail * 1.15);
+      else if (quality < 1) quality = Math.min(1, quality * 1.12);
+    }
+    if (quality !== this.quality || detail !== this.detail) {
+      if (quality !== this.quality) this.layersDirty = true;
+      this.quality = quality;
+      this.detail = detail;
       this.slowFor = 0;
       this.fastFor = 0;
       this.settle = 0.75;
-      this.layersDirty = true;
     }
   }
 
@@ -621,9 +781,14 @@ export class AetherField {
     out.height = view.trailCanvas.height;
     const ctx = out.getContext("2d");
     if (!ctx) return null;
+    if (view.gl) {
+      // A WebGL canvas is only readable in the task that drew it, so draw it again here.
+      this.composeGL(view.gl, this.lastInk);
+      ctx.drawImage(view.trailCanvas, 0, 0);
+      return out;
+    }
+    if (!view.overlay) return null;
     const rs = this.renderScale;
-    // A WebGL canvas is only readable in the task that drew it, so draw it again here.
-    if (view.gl) view.gl.present(this.glowAlpha);
     ctx.setTransform(rs, 0, 0, rs, 0, 0);
     ctx.fillStyle = ground.hex;
     ctx.fillRect(0, 0, this.w, this.h);
@@ -670,13 +835,17 @@ export class AetherField {
 
   private atmosphere(ink: boolean) {
     const share = clamp(0.5 + this.pressure * 0.5, 0, 1);
+    const buyRgb = ink ? [18, 140, 100] : [31, 191, 138];
+    const sellRgb = ink ? [170, 46, 24] : [226, 70, 44];
     const base = ink ? 0.07 : 0.13;
     return {
       fx: this.front * this.w,
       cy: this.h * 0.55,
       reach: Math.max(this.w, this.h) * 0.75,
-      buy: ink ? "18,140,100" : "31,191,138",
-      sell: ink ? "170,46,24" : "226,70,44",
+      buyRgb,
+      sellRgb,
+      buy: buyRgb.join(","),
+      sell: sellRgb.join(","),
       buyA: (base * (0.55 + share * 0.9)).toFixed(3),
       sellA: (base * (0.55 + (1 - share) * 0.9)).toFixed(3),
       key: `${Math.round(share * 40)}|${Math.round(this.front * 80)}`,
