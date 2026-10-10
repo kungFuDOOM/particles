@@ -257,6 +257,18 @@
   display: none;
 }
 
+/* WebGL paints backdrop, trails, bloom, overlay and vignette into one opaque canvas. */
+.field[data-renderer="gpu"] .field-trail {
+  mix-blend-mode: normal;
+}
+
+.field[data-renderer="gpu"] .field-backdrop,
+.field[data-renderer="gpu"] .field-glow,
+.field[data-renderer="gpu"] .field-overlay,
+.field[data-renderer="gpu"] .field-vignette {
+  display: none;
+}
+
 .field-vignette {
   background: radial-gradient(circle farthest-corner at center, transparent 40%, rgba(0, 0, 0, 0.55) 100%);
 }
